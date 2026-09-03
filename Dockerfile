@@ -36,12 +36,15 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama
 
 RUN cd /src/llama.cpp && bash /rdna/scripts/apply-all.sh /src/llama.cpp /rdna
 
-# HIP build (GGML_HIP_GRAPHS + NATIVE kept for parity with the tuned ref build).
+# HIP build (GGML_HIP_GRAPHS kept; GGML_NATIVE deliberately OFF: -march=native
+# bakes the CI runner's CPU (often AVX512 EPYC) into the binary and collapses
+# the multi-variant libggml-cpu-*.so dispatch into one .so that may SIGILL on
+# bear's Comet Lake i9 — stock images build the portable dispatch set).
 # NOTE: no trailing `|| true` — a failed configure/build must fail the job.
 RUN --mount=type=cache,target=/root/.ccache \
     cd /src/llama.cpp \
  && cmake -B build -G Ninja \
-      -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGGML_HIP_GRAPHS=ON -DGGML_NATIVE=1 \
+      -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGGML_HIP_GRAPHS=ON \
       -DGPU_TARGETS="${GPU_TARGETS}" -DGGML_CCACHE=ON \
       -DCMAKE_BUILD_TYPE=Release \
  && cmake --build build -j"$(nproc)"
@@ -55,7 +58,8 @@ RUN mkdir -p /stage \
  && CLI="$(find . -name llama-cli -type f | head -1)" \
  && test -n "$SRV" -a -n "$CLI" \
  && cp "$SRV" "$CLI" /stage/ \
- && ls /stage/ | head -n 30
+ && ls /stage/ | head -n 30 \
+ && test "$(ls /stage/ | grep -cE '^libggml-cpu-.*\.so')" -ge 10 && test -e /stage/libggml-hip.so
 
 # Smoke test: no missing shared-lib deps (runs without a GPU).
 RUN ldd /stage/llama-server | grep -i "not found" && exit 1 || echo "ldd clean" \

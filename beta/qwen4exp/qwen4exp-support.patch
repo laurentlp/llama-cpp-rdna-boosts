@@ -119,10 +119,18 @@ index b88b7e54a..2e49aceb1 100644
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index bb5ea33b3..4465c83e2 100644
+index bb5ea33b3..a3c378cc4 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -790,6 +790,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -4,6 +4,7 @@
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-cpp.h"
++#include "ggml-moe-weighted-reduction.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -790,6 +791,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
          return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
      };
  
@@ -144,7 +152,7 @@ index bb5ea33b3..4465c83e2 100644
      auto handle_lightning_indexer = [&](
              const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
          for (size_t i = 0; i < 4; i++) {
-@@ -1012,6 +1027,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1012,6 +1028,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_FLASH_ATTN_EXT: {
                  split_state = handle_flash_attn_ext(src_ss);
              } break;
@@ -161,7 +169,7 @@ index bb5ea33b3..4465c83e2 100644
              case GGML_OP_FLASH_ATTN_BACK: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
-@@ -1040,6 +1065,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1040,6 +1066,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_DSV4_HC_POST: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
@@ -191,7 +199,51 @@ index bb5ea33b3..4465c83e2 100644
              case GGML_OP_UNARY: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ false);
              } break;
-@@ -2265,7 +2313,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -1971,6 +2020,43 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+     }
+ }
+ 
++// The fused per-device kernels (see ggml_cuda_try_fuse) must not write into a
++// source they still read. The scheduler allocates the graph's tensors before
++// the Meta backend dispatches the per-device subgraphs, so the CUDA-side
++// graph_optimize (which registers the alloc deps against the scheduler's
++// allocator) never runs for graphs owned by this backend. Walk the graph for
++// the same structural patterns here so the gallocr keeps the sources alive
++// until the fused kernel's destination is written.
++static void ggml_backend_meta_graph_optimize(ggml_backend_t backend,
++                                             struct ggml_cgraph * cgraph,
++                                             struct ggml_backend_graph_optimize_params * params) {
++    GGML_UNUSED(backend);
++
++    static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
++    if (disable_fusion) {
++        return;
++    }
++
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        if (cgraph->nodes[i]->op != GGML_OP_MUL) {
++            continue;
++        }
++
++        ggml_moe_weighted_reduction_match match;
++        if (!ggml_match_moe_weighted_reduction(cgraph, i, match)) {
++            continue;
++        }
++
++        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
++        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
++        if (match.expert_scale != nullptr) {
++            params->add_alloc_dep(
++                params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
++        }
++        i += match.node_count - 1;
++    }
++}
++
+ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     GGML_ASSERT(cgraph->grads == nullptr);
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+@@ -2265,7 +2351,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              backend_ctx->ctx.reset(ggml_init(params));
              for (size_t j = 0; j < n_backends; j++) {
                  auto & bcj = backend_ctx->backend_configs[j];
@@ -203,6 +255,15 @@ index bb5ea33b3..4465c83e2 100644
                      bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
                  }
              }
+@@ -2494,7 +2583,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
+     /* .event_record            = */ nullptr,
+     /* .event_wait              = */ nullptr,
+-    /* .graph_optimize          = */ nullptr,
++    /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
+ };
+ 
+ bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index ffe20b9d0..dd3bc6ec3 100644
 --- a/ggml/src/ggml-backend.cpp
@@ -783,10 +844,10 @@ index 4c1642a67..259f418a4 100644
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
 new file mode 100644
-index 000000000..a23334164
+index 000000000..63398ca6c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,617 @@
 +#include "common.cuh"
 +#include "fattn-qsa.cuh"
 +#include "fattn-common.cuh"
@@ -830,6 +891,10 @@ index 000000000..a23334164
 +        const int  * idx_ptr,
 +        const char * mask_ptr,
 +        float      * dst_ptr,
++        float      * parts_ptr,
++        float2     * meta_ptr,
++        const int    n_slices,
++        const int    n_slice_cells,
 +        const float scale,
 +        const float logit_softcap,
 +        const bool   identity,
@@ -849,10 +914,12 @@ index 000000000..a23334164
 +    const char * GGML_CUDA_RESTRICT V    = V_ptr;
 +    const int  * GGML_CUDA_RESTRICT idx  = idx_ptr;
 +    const char * GGML_CUDA_RESTRICT mask = mask_ptr;
-+    float      * GGML_CUDA_RESTRICT dst  = dst_ptr;
++    float      * GGML_CUDA_RESTRICT dst   = dst_ptr;
++    float      * GGML_CUDA_RESTRICT parts = parts_ptr;
++    float2     * GGML_CUDA_RESTRICT meta  = meta_ptr;
 +
 +    if constexpr (use_logit_softcap) {
-+        GGML_UNUSED_VARS(Q, K, V, idx, mask, dst, scale, logit_softcap,
++        GGML_UNUSED_VARS(Q, K, V, idx, mask, dst, parts, meta, n_slices, n_slice_cells, scale, logit_softcap,
 +            ne00, ne01, ne02, ne03, nb01, nb02, nb03,
 +            ne10, ne11, ne12, ne13, nb11, nb12, nb13,
 +            nb21, nb22, nb23, ne30, ne31, ne33, nb31, nb33,
@@ -861,9 +928,13 @@ index 000000000..a23334164
 +        return;
 +    }
 +
-+    // One block per (column, stream); warp w = head w.
++    // One block per (column, top-k slice, stream); warp w = head w.
++    // With n_slices == 1 the block walks the whole top-k list and writes the
++    // final result; sliced, each block walks its slice of the list and writes
++    // an unnormalized partial plus (max, sum) that a combine kernel merges.
 +    const int col = blockIdx.x;
 +    const int tid = threadIdx.x;
++    const int slice = blockIdx.y;
 +
 +    const int sequence = blockIdx.z;
 +    const int head     = threadIdx.y;
@@ -878,6 +949,10 @@ index 000000000..a23334164
 +    V += nb23*sequence + nb22*(head / gqa_ratio);
 +    idx += col*ne40 + sequence*ne40*ne41; // [n_top_k, n_tps, 1, n_stream]
 +    const half * maskh = (const half *) (mask + nb33*(sequence % ne33) + nb31*col);
++
++    const int row  = (sequence*int(ne01.z) + col)*ne02 + head;
++    const int k0   = slice*n_slice_cells;
++    const int k1   = min(ne40, k0 + n_slice_cells);
 +
 +    // Per-warp tile exp weights, staged in shared:
 +    constexpr int NHEADS_MAX = 16; // launch bounds: 16 warps max
@@ -927,7 +1002,7 @@ index 000000000..a23334164
 +        float2 VKQ[D/(2*WARP_SIZE)] = {};
 +
 +        const int n_top_k = ne40;
-+        for (int tile0 = 0; tile0 < n_top_k; tile0 += WARP_SIZE) {
++        for (int tile0 = k0; tile0 < k1; tile0 += WARP_SIZE) {
 +            const int tile_len = min(WARP_SIZE, n_top_k - tile0);
 +
 +            // Cooperative gather of the tile's K/V cells into shared memory.
@@ -1064,11 +1139,22 @@ index 000000000..a23334164
 +            __syncthreads();
 +        }
 +
-+        float * dst_col = dst + ((sequence*int(ne01.z) + col)*ne02 + head)*D;
-+        float2 * dst2 = (float2 *) dst_col;
++        float * dst_out = dst + row*D;
++        if (n_slices == 1) {
++            float2 * dst2 = (float2 *) dst_out;
 +#pragma unroll
-+        for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
-+            dst2[tid + k*WARP_SIZE] = make_float2(VKQ[k].x / KQ_sum, VKQ[k].y / KQ_sum);
++            for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
++                dst2[tid + k*WARP_SIZE] = make_float2(VKQ[k].x / KQ_sum, VKQ[k].y / KQ_sum);
++            }
++        } else {
++            float2 * dst2 = (float2 *) (parts + (row*n_slices + slice)*D);
++#pragma unroll
++            for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
++                dst2[tid + k*WARP_SIZE] = make_float2(VKQ[k].x, VKQ[k].y);
++            }
++            if (tid == 0) {
++                meta[row*n_slices + slice] = make_float2(KQ_max, KQ_sum);
++            }
 +        }
 +    } else {
 +        // BF16 K/V
@@ -1088,10 +1174,14 @@ index 000000000..a23334164
 +        float2 VKQ[D/(2*WARP_SIZE)] = {};
 +
 +        const int n_top_k = ne40;
-+        for (int tile0 = 0; tile0 < n_top_k; tile0 += WARP_SIZE) {
++        for (int tile0 = k0; tile0 < k1; tile0 += WARP_SIZE) {
 +            const int tile_len = min(WARP_SIZE, n_top_k - tile0);
 +
-+            // Cooperative gather of the tile's K cells into shared memory:
++            // Cooperative gather of the tile's K/V cells into shared memory.
++            // V must be staged here too, like the F16/Q8_0 gather does: the
++            // VKQ pass below would otherwise re-read every cell's V from L2
++            // once per head-warp (gqa makes the cells shared), and the
++            // redundant traffic grows with the cache spread.
 +            {
 +                const int flat  = threadIdx.y*WARP_SIZE + tid;
 +                const int nload = tile_len*(D/2);
@@ -1100,6 +1190,7 @@ index 000000000..a23334164
 +                    const int off  = i%(D/2);
 +                    const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
 +                    K_smem[cell][off] = ((const nv_bfloat162 *) (K + (int64_t) cell_g*nb11))[off];
++                    V_smem[cell][off] = ((const nv_bfloat162 *) (V + (int64_t) cell_g*nb21))[off];
 +                }
 +                // the per-cell mask must be staged here too - the score pass
 +                // reads M_smem for every K/V type, but only the F16/Q8_0
@@ -1155,8 +1246,7 @@ index 000000000..a23334164
 +            for (int c = 0; c < WARP_SIZE; ++c) {
 +                const float w = (c < tile_len) ? KQ_warp[c] : 0.0f;
 +                if (w != 0.0f) {
-+                    const int cell_c = (c < tile_len) ? (identity ? tile0 + c : idx[tile0 + c]) : 0;
-+                    const nv_bfloat162 * V_cell = (const nv_bfloat162 *) (V + (int64_t) cell_c*nb21);
++                    const nv_bfloat162 * V_cell = V_smem[c];
 +#pragma unroll
 +                    for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
 +                        const nv_bfloat162 v = V_cell[tid + k*WARP_SIZE];
@@ -1168,15 +1258,27 @@ index 000000000..a23334164
 +            __syncthreads();
 +        }
 +
-+        float * dst_col = dst + ((sequence*int(ne01.z) + col)*ne02 + head)*D;
-+        float2 * dst2 = (float2 *) dst_col;
++        float * dst_out = dst + row*D;
++        if (n_slices == 1) {
++            float2 * dst2 = (float2 *) dst_out;
 +#pragma unroll
-+        for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
-+            dst2[tid + k*WARP_SIZE] = make_float2(VKQ[k].x / KQ_sum, VKQ[k].y / KQ_sum);
++            for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
++                dst2[tid + k*WARP_SIZE] = make_float2(VKQ[k].x / KQ_sum, VKQ[k].y / KQ_sum);
++            }
++        } else {
++            float2 * dst2 = (float2 *) (parts + (row*n_slices + slice)*D);
++#pragma unroll
++            for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
++                dst2[tid + k*WARP_SIZE] = make_float2(VKQ[k].x, VKQ[k].y);
++            }
++            if (tid == 0) {
++                meta[row*n_slices + slice] = make_float2(KQ_max, KQ_sum);
++            }
 +        }
 +    }
 +#else
-+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, idx_ptr, mask_ptr, dst_ptr, scale, logit_softcap, identity,
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, idx_ptr, mask_ptr, dst_ptr, parts_ptr, meta_ptr, n_slices, n_slice_cells,
++        scale, logit_softcap, identity,
 +        ne00, ne01, ne02, ne03, nb01, nb02, nb03,
 +        ne10, ne11, ne12, ne13, nb11, nb12, nb13,
 +        nb21, nb22, nb23, ne30, ne31, ne33, nb31, nb33,
@@ -1204,8 +1306,53 @@ index 000000000..a23334164
 +        scale /= logit_softcap;
 +    }
 +
-+    const dim3 blocks_num(Q->ne[1], 1, Q->ne[3]);
++    // Slice the top-k list across gridDim.y when the base grid (tokens x
++    // streams) under-uses the GPU, mirroring the dense FA's KV slicing: each
++    // block walks one slice of the list with its own online softmax and
++    // writes an unnormalized partial + (max, sum); a combine kernel merges.
++    // Decode (base grid 1) is the target: a single block cannot leave one
++    // CU, so the full-list walk would serialize there.
++    const int64_t n_top_k     = idx->ne[0];
++    const int     base_blocks = Q->ne[1]*Q->ne[3];
++    const int     nsm         = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++
++    int n_slices      = 1;
++    int n_slice_cells = (int) n_top_k;
++    const char * qsa_slices_env = getenv("GGML_CUDA_QSA_SLICES");
++    if (qsa_slices_env != nullptr) {
++        n_slices = std::max(1, std::atoi(qsa_slices_env)); // debug override
++        n_slice_cells = (n_slices > 1) ? (int) ((n_top_k + n_slices - 1) / n_slices + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE : (int) n_top_k;
++    } else if (base_blocks < nsm && n_top_k > 0) {
++        constexpr int slice_cells = 64;  // cells per slice (multiple of WARP_SIZE)
++        n_slices      = (int) ((n_top_k + slice_cells - 1) / slice_cells);
++        n_slice_cells = slice_cells;
++    }
++
++    ggml_cuda_pool & pool = ctx.pool();
++    ggml_cuda_pool_alloc<float>  parts(pool);
++    ggml_cuda_pool_alloc<float2> meta(pool);
++    float * dst_data = (float *) dst->data;
++    if (n_slices > 1) {
++        parts.alloc((size_t) n_slices * ggml_nelements(dst));
++        meta.alloc((size_t) n_slices * ggml_nrows(dst));
++        dst_data = parts.ptr;
++    }
++
++    const dim3 blocks_num(Q->ne[1], n_slices, Q->ne[3]);
 +    const dim3 block_dim(WARP_SIZE, Q->ne[2], 1);
++
++    static const bool qsa_debug = []() {
++        const char * env = getenv("GGML_CUDA_QSA_DEBUG");
++        return env != nullptr;
++    }();
++    if (qsa_debug) {
++        fprintf(stderr, "QSA_DEBUG dev %d layer-D%d kv %d n_kv=%d n_top_k=%d n_tps=%d n_stream=%d n_head=%d gqa=%d slices=%d block=(%d,%d,%d) grid=(%d,%d,%d)\n",
++                ctx.device, D, (int) K->type, (int) K->ne[1], (int) n_top_k,
++                (int) Q->ne[1], (int) Q->ne[3], (int) Q->ne[2],
++                (int) (Q->ne[2] / std::max(1, (int) K->ne[2])),
++                n_slices,
++                block_dim.x, block_dim.y, block_dim.z, blocks_num.x, blocks_num.y, blocks_num.z);
++    }
 +
 +    const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 +
@@ -1219,6 +1366,7 @@ index 000000000..a23334164
 +            (const int  *) idx->data,
 +            (const char *) mask->data,
 +            (float *) dst->data,
++            dst_data, meta.ptr, n_slices, n_slice_cells,
 +            scale, logit_softcap, identity,
 +            Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
 +            K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
@@ -1234,12 +1382,22 @@ index 000000000..a23334164
 +            (const int  *) idx->data,
 +            (const char *) mask->data,
 +            (float *) dst->data,
++            dst_data, meta.ptr, n_slices, n_slice_cells,
 +            scale, logit_softcap, identity,
 +            Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
 +            K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
 +            V->nb[1], V->nb[2], V->nb[3],
 +            mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
 +            idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
++    }
++
++    if (n_slices > 1) {
++        const dim3 block_dim_combine(D, 1, 1);
++        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
++        const size_t nbytes_shared_combine = n_slices*sizeof(float2);
++        const ggml_cuda_kernel_launch_params launch_params_combine(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
++        ggml_cuda_kernel_launch(flash_attn_combine_results<D>, launch_params_combine,
++            parts.ptr, meta.ptr, (float *) dst->data, n_slices);
 +    }
 +    CUDA_CHECK(cudaGetLastError());
 +}
@@ -1336,10 +1494,17 @@ index 000000000..0a2059477
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 302a3c997..29cb90b39 100644
+index 302a3c997..6a7bae14d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -25,6 +25,8 @@
+@@ -1,5 +1,6 @@
+ #include "ggml-cuda.h"
+ #include "ggml-impl.h"
++#include "ggml-moe-weighted-reduction.h"
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-cuda/allreduce.cuh"
+@@ -25,6 +26,8 @@
  #include "ggml-cuda/diagmask.cuh"
  #include "ggml-cuda/diag.cuh"
  #include "ggml-cuda/fattn.cuh"
@@ -1348,7 +1513,7 @@ index 302a3c997..29cb90b39 100644
  #include "ggml-cuda/fwht.cuh"
  #include "ggml-cuda/getrows.cuh"
  #include "ggml-cuda/im2col.cuh"
-@@ -61,6 +63,7 @@
+@@ -61,6 +64,7 @@
  #include "ggml-cuda/gla.cuh"
  #include "ggml-cuda/gated_delta_net.cuh"
  #include "ggml-cuda/dsv4-hc.cuh"
@@ -1356,7 +1521,7 @@ index 302a3c997..29cb90b39 100644
  #include "ggml-cuda/set.cuh"
  #include "ggml-cuda/set-rows.cuh"
  #include "ggml-cuda/pad_reflect_1d.cuh"
-@@ -2450,6 +2453,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2450,6 +2454,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_FLASH_ATTN_EXT:
              ggml_cuda_flash_attn_ext(ctx, dst);
              break;
@@ -1369,7 +1534,7 @@ index 302a3c997..29cb90b39 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -2474,6 +2483,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2474,6 +2484,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -1382,7 +1547,185 @@ index 302a3c997..29cb90b39 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -6233,8 +6248,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -3191,151 +3207,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+     return is_ok;
+ }
+ 
+-// The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
+-// 31 nodes, so k <= 15; larger values use the per-operation path.
+-static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
+-
+-struct ggml_cuda_moe_weighted_reduction_match {
+-    const ggml_tensor * experts      = nullptr;
+-    const ggml_tensor * expert_scale = nullptr;
+-    const ggml_tensor * weights      = nullptr;
+-    ggml_tensor *       dst          = nullptr;
+-    int                 node_count   = 0;
+-};
+-
+-static bool ggml_cuda_match_moe_weighted_reduction(
+-        const ggml_cgraph * cgraph,
+-        int node_idx,
+-        ggml_cuda_moe_weighted_reduction_match & match) {
+-    const ggml_tensor * first = cgraph->nodes[node_idx];
+-    if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
+-        return false;
+-    }
+-
+-    auto split_mul = [](const ggml_tensor * mul, const ggml_tensor *& full, const ggml_tensor *& broadcast) {
+-        auto is_weights = [mul](const ggml_tensor * tensor) {
+-            return tensor && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor) && tensor->ne[0] == 1 &&
+-                tensor->ne[1] == mul->ne[1] && tensor->ne[2] == mul->ne[2] && tensor->ne[3] == mul->ne[3];
+-        };
+-        auto is_experts = [mul](const ggml_tensor * tensor) {
+-            return tensor && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor) &&
+-                ggml_are_same_shape(tensor, mul);
+-        };
+-
+-        if (is_experts(mul->src[0]) && is_weights(mul->src[1])) {
+-            full      = mul->src[0];
+-            broadcast = mul->src[1];
+-            return true;
+-        }
+-        if (is_experts(mul->src[1]) && is_weights(mul->src[0])) {
+-            full      = mul->src[1];
+-            broadcast = mul->src[0];
+-            return true;
+-        }
+-        return false;
+-    };
+-
+-    const ggml_tensor * weighted     = first;
+-    const ggml_tensor * experts      = nullptr;
+-    const ggml_tensor * expert_scale = nullptr;
+-    const ggml_tensor * weights      = nullptr;
+-    int                 mul_count    = 1;
+-
+-    // Match both structural forms:
+-    //   (experts * expert_scale) * router_weight
+-    //   experts * router_weight
+-    // The matcher does not depend on the model or quantization type.
+-    if (node_idx + 1 < cgraph->n_nodes) {
+-        const ggml_tensor * second = cgraph->nodes[node_idx + 1];
+-        const ggml_tensor * scaled = nullptr;
+-        const ggml_tensor * route  = nullptr;
+-        const ggml_tensor * raw    = nullptr;
+-        const ggml_tensor * scale  = nullptr;
+-        if (second->op == GGML_OP_MUL && second->type == GGML_TYPE_F32 && ggml_is_contiguous(second) &&
+-                split_mul(second, scaled, route) && scaled == first && split_mul(first, raw, scale)) {
+-            weighted     = second;
+-            experts      = raw;
+-            expert_scale = scale;
+-            weights      = route;
+-            mul_count    = 2;
+-        }
+-    }
+-
+-    if (experts == nullptr && !split_mul(first, experts, weights)) {
+-        return false;
+-    }
+-
+-    const int     n_expert_used = (int) weighted->ne[1];
+-    const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
+-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+-        return false;
+-    }
+-
+-    const int node_count = 2 * n_expert_used + mul_count - 1;
+-    if (node_idx + node_count > cgraph->n_nodes) {
+-        return false;
+-    }
+-
+-    std::vector<ggml_op> ops(node_count, GGML_OP_VIEW);
+-    ops[0] = GGML_OP_MUL;
+-    if (mul_count == 2) {
+-        ops[1] = GGML_OP_MUL;
+-    }
+-    std::vector<const ggml_tensor *> views;
+-    views.reserve(n_expert_used);
+-    const ggml_tensor * previous = nullptr;
+-    int n_adds = 0;
+-    for (int offset = mul_count; offset < node_count; ++offset) {
+-        const ggml_tensor * candidate = cgraph->nodes[node_idx + offset];
+-        ops[offset] = candidate->op;
+-
+-        if (candidate->op == GGML_OP_VIEW) {
+-            const int expert = (int) views.size();
+-            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
+-                    candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
+-                    candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
+-                    candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
+-                    candidate->view_offs != (size_t) expert * weighted->nb[1]) {
+-                return false;
+-            }
+-            views.push_back(candidate);
+-            continue;
+-        }
+-
+-        if (candidate->op != GGML_OP_ADD || views.size() < 2 || n_adds + 1 >= (int) views.size()) {
+-            return false;
+-        }
+-        const ggml_tensor * lhs = n_adds == 0 ? views[0] : previous;
+-        const ggml_tensor * rhs = views[n_adds + 1];
+-        if (candidate->src[0] != lhs || candidate->src[1] != rhs || candidate->type != GGML_TYPE_F32) {
+-            return false;
+-        }
+-        previous = candidate;
+-        ++n_adds;
+-    }
+-
+-    if ((int) views.size() != n_expert_used || n_adds != n_expert_used - 1 || previous == nullptr) {
+-        return false;
+-    }
+-    if (!ggml_is_contiguous(previous) || previous->ne[0] != weighted->ne[0] ||
+-            previous->ne[1] != n_tokens || previous->ne[2] != 1 || previous->ne[3] != 1) {
+-        return false;
+-    }
+-
+-    const int output_idx = node_idx + node_count - 1;
+-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+-        return false;
+-    }
+-
+-    match.experts      = experts;
+-    match.expert_scale = expert_scale;
+-    match.weights      = weights;
+-    match.dst          = cgraph->nodes[output_idx];
+-    match.node_count   = node_count;
+-    return true;
+-}
+-
+-
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -3603,10 +3474,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     ggml_tensor * node = cgraph->nodes[i];
+ 
+     if (node->op == GGML_OP_MUL) {
+-        ggml_cuda_moe_weighted_reduction_match match;
+-        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
++        ggml_moe_weighted_reduction_match match;
++        static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
++        if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
+             const int output_idx = i + match.node_count - 1;
+             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
++                if (mwr_dbg2) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
+                 ggml_cuda_op_moe_weighted_reduction(
+                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                 return match.node_count - 1;
+@@ -5246,8 +5119,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                 continue;
+             }
+ 
+-            ggml_cuda_moe_weighted_reduction_match match;
+-            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
++            ggml_moe_weighted_reduction_match match;
++            if (!ggml_match_moe_weighted_reduction(cgraph, i, match)) {
+                 continue;
+             }
+ 
+@@ -6233,8 +6106,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -1877,10 +2220,10 @@ index 000000000..166350138
 +void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
 new file mode 100644
-index 000000000..f0b4c77b4
+index 000000000..62854dda5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,260 @@
 +#include "indexer-topk.cuh"
 +#include "common.cuh"
 +
@@ -2141,7 +2484,6 @@ index 000000000..f0b4c77b4
 +        (additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32) &&
 +        dst->type == GGML_TYPE_I32;
 +}
-+
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cuh b/ggml/src/ggml-cuda/indexer-topk.cuh
 new file mode 100644
 index 000000000..a7b3c338d
@@ -2197,6 +2539,172 @@ index 0aecddf66..cca013ea7 100644
  }
  
  void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+diff --git a/ggml/src/ggml-moe-weighted-reduction.h b/ggml/src/ggml-moe-weighted-reduction.h
+new file mode 100644
+index 000000000..c90460a45
+--- /dev/null
++++ b/ggml/src/ggml-moe-weighted-reduction.h
+@@ -0,0 +1,160 @@
++// Structural matcher for the MoE weighted expert reduction:
++//   ffn_moe_weighted = experts * router_weights   (experts may be pre-scaled)
++// followed by one view per expert and a chain of adds collapsing the expert
++// axis. Both the CUDA fusion pass (ggml-cuda.cu) and the Meta-TP backend's
++// graph optimizer (ggml-backend-meta.cpp) need the same walk: the fusion
++// turns the whole chain into one kernel, and the optimizer registers the
++// alloc deps that keep `experts` alive so the kernel's destination cannot
++// alias it.
++//
++// Portable: pure ggml types, no backend-specific headers.
++
++#pragma once
++
++#include "ggml-impl.h"
++
++#include <vector>
++
++struct ggml_moe_weighted_reduction_match {
++    const ggml_tensor * experts      = nullptr;
++    const ggml_tensor * expert_scale = nullptr;
++    const ggml_tensor * weights      = nullptr;
++    ggml_tensor *       dst          = nullptr;
++    int                 node_count   = 0;
++};
++
++// The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
++// 31 nodes, so k <= 15; larger values use the per-operation path.
++static constexpr int GGML_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
++
++static inline bool ggml_match_moe_weighted_reduction(
++        const ggml_cgraph * cgraph,
++        int node_idx,
++        ggml_moe_weighted_reduction_match & match) {
++    const ggml_tensor * first = cgraph->nodes[node_idx];
++    if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
++        return false;
++    }
++
++    auto split_mul = [](const ggml_tensor * mul, const ggml_tensor *& full, const ggml_tensor *& broadcast) {
++        auto is_weights = [mul](const ggml_tensor * tensor) {
++            return tensor && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor) && tensor->ne[0] == 1 &&
++                tensor->ne[1] == mul->ne[1] && tensor->ne[2] == mul->ne[2] && tensor->ne[3] == mul->ne[3];
++        };
++        auto is_experts = [mul](const ggml_tensor * tensor) {
++            return tensor && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor) &&
++                ggml_are_same_shape(tensor, mul);
++        };
++
++        if (is_experts(mul->src[0]) && is_weights(mul->src[1])) {
++            full      = mul->src[0];
++            broadcast = mul->src[1];
++            return true;
++        }
++        if (is_experts(mul->src[1]) && is_weights(mul->src[0])) {
++            full      = mul->src[1];
++            broadcast = mul->src[0];
++            return true;
++        }
++        return false;
++    };
++
++    const ggml_tensor * weighted     = first;
++    const ggml_tensor * experts      = nullptr;
++    const ggml_tensor * expert_scale = nullptr;
++    const ggml_tensor * weights      = nullptr;
++    int                 mul_count    = 1;
++
++    // Match both structural forms:
++    //   (experts * expert_scale) * router_weight
++    //   experts * router_weight
++    // The matcher does not depend on the model or quantization type.
++    if (node_idx + 1 < cgraph->n_nodes) {
++        const ggml_tensor * second = cgraph->nodes[node_idx + 1];
++        const ggml_tensor * scaled = nullptr;
++        const ggml_tensor * route  = nullptr;
++        const ggml_tensor * raw    = nullptr;
++        const ggml_tensor * scale  = nullptr;
++        if (second->op == GGML_OP_MUL && second->type == GGML_TYPE_F32 && ggml_is_contiguous(second) &&
++                split_mul(second, scaled, route) && scaled == first && split_mul(first, raw, scale)) {
++            weighted     = second;
++            experts      = raw;
++            expert_scale = scale;
++            weights      = route;
++            mul_count    = 2;
++        }
++    }
++
++    if (experts == nullptr && !split_mul(first, experts, weights)) {
++        return false;
++    }
++
++    const int     n_expert_used = (int) weighted->ne[1];
++    const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
++    if (n_expert_used < 2 || n_expert_used > GGML_MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
++        return false;
++    }
++
++    const int node_count = 2 * n_expert_used + mul_count - 1;
++    if (node_idx + node_count > cgraph->n_nodes) {
++        return false;
++    }
++
++    std::vector<ggml_op> ops(node_count, GGML_OP_VIEW);
++    ops[0] = GGML_OP_MUL;
++    if (mul_count == 2) {
++        ops[1] = GGML_OP_MUL;
++    }
++    std::vector<const ggml_tensor *> views;
++    views.reserve(n_expert_used);
++    const ggml_tensor * previous = nullptr;
++    int n_adds = 0;
++    for (int offset = mul_count; offset < node_count; ++offset) {
++        const ggml_tensor * candidate = cgraph->nodes[node_idx + offset];
++        ops[offset] = candidate->op;
++
++        if (candidate->op == GGML_OP_VIEW) {
++            const int expert = (int) views.size();
++            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
++                    candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
++                    candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
++                    candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
++                    candidate->view_offs != (size_t) expert * weighted->nb[1]) {
++                return false;
++            }
++            views.push_back(candidate);
++            continue;
++        }
++
++        if (candidate->op != GGML_OP_ADD || views.size() < 2 || n_adds + 1 >= (int) views.size()) {
++            return false;
++        }
++        const ggml_tensor * lhs = n_adds == 0 ? views[0] : previous;
++        const ggml_tensor * rhs = views[n_adds + 1];
++        if (candidate->src[0] != lhs || candidate->src[1] != rhs || candidate->type != GGML_TYPE_F32) {
++            return false;
++        }
++        previous = candidate;
++        ++n_adds;
++    }
++
++    if ((int) views.size() != n_expert_used || n_adds != n_expert_used - 1 || previous == nullptr) {
++        return false;
++    }
++    if (!ggml_is_contiguous(previous) || previous->ne[0] != weighted->ne[0] ||
++            previous->ne[1] != n_tokens || previous->ne[2] != 1 || previous->ne[3] != 1) {
++        return false;
++    }
++
++    const int output_idx = node_idx + node_count - 1;
++    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
++        return false;
++    }
++
++    match.experts      = experts;
++    match.expert_scale = expert_scale;
++    match.weights      = weights;
++    match.dst          = cgraph->nodes[output_idx];
++    match.node_count   = node_count;
++    return true;
++}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 8dc094508..2de437b08 100644
 --- a/ggml/src/ggml.c

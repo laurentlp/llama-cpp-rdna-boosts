@@ -59,7 +59,7 @@ RUN mkdir -p /stage \
  && test -n "$SRV" -a -n "$CLI" \
  && cp "$SRV" "$CLI" /stage/ \
  && ls /stage/ | head -n 30 \
- && test "$(ls /stage/ | grep -cE '^libggml-cpu-.*\.so')" -ge 10 && test -e /stage/libggml-hip.so
+ && test -e /stage/libggml-hip.so && test -e /stage/libggml-cpu.so && test -e /stage/libggml-base.so && test -e /stage/llama-server && test -e /stage/llama-cli
 
 # Smoke test: no missing shared-lib deps (runs without a GPU).
 RUN ldd /stage/llama-server | grep -i "not found" && exit 1 || echo "ldd clean" \

@@ -18,7 +18,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git cmake ninja-build ccache curl libcurl4-openssl-dev \
-      rocblas-dev hipblas-dev hipsparse-dev hipsolver-dev \
+      rocblas-dev hipblas-dev hipsparse-dev hipsolver-dev rccl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Patches + apply script from this repo (own layer: reruns only when they change).

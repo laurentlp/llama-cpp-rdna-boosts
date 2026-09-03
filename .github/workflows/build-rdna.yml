@@ -24,10 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No setup-buildx-action: the runner's default `docker` driver (daemon
-      # buildkit over POST /build) is proxy-safe as-is. setup-buildx would
-      # try to provision a container builder the proxy blocks (403), and a
-      # second `docker`-driver instance can't be created anyway.
+      - uses: docker/setup-buildx-action@v3
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io

@@ -18,6 +18,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git cmake ninja-build ccache curl libcurl4-openssl-dev \
+      rocblas-dev hipblas-dev hipsparse-dev hipsolver-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Patches + apply script from this repo (own layer: reruns only when they change).
@@ -36,20 +37,25 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama
 RUN cd /src/llama.cpp && bash /rdna/scripts/apply-all.sh /src/llama.cpp /rdna
 
 # HIP build (GGML_HIP_GRAPHS + NATIVE kept for parity with the tuned ref build).
+# NOTE: no trailing `|| true` — a failed configure/build must fail the job.
 RUN --mount=type=cache,target=/root/.ccache \
     cd /src/llama.cpp \
  && cmake -B build -G Ninja \
       -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGGML_HIP_GRAPHS=ON -DGGML_NATIVE=1 \
       -DGPU_TARGETS="${GPU_TARGETS}" -DGGML_CCACHE=ON \
       -DCMAKE_BUILD_TYPE=Release \
- && cmake --build build -j"$(nproc)" \
- && ccache -s || true
+ && cmake --build build -j"$(nproc)"
 
 # Collect every built .so (preserving versioned symlinks) + server/cli tools.
+# Binary dir is located, not assumed: must exist or the job fails here loudly.
 RUN mkdir -p /stage \
  && cd /src/llama.cpp/build \
  && find . -name 'lib*.so*' -exec cp -P {} /stage/ \; \
- && cp bin/llama-server bin/llama-cli /stage/
+ && SRV="$(find . -name llama-server -type f | head -1)" \
+ && CLI="$(find . -name llama-cli -type f | head -1)" \
+ && test -n "$SRV" -a -n "$CLI" \
+ && cp "$SRV" "$CLI" /stage/ \
+ && ls /stage/ | head -n 30
 
 # Smoke test: no missing shared-lib deps (runs without a GPU).
 RUN ldd /stage/llama-server | grep -i "not found" && exit 1 || echo "ldd clean" \

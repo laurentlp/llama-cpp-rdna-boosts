@@ -25,6 +25,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
+        with:
+          # docker driver uses the daemon's built-in buildkit over POST /build
+          # (proxy-safe). The default docker-container driver needs an attach/
+          # hijack upgrade the socket-proxy blocks (403) — that would require
+          # EXEC=1, deliberately not enabled. Single-arch build needs nothing more.
+          driver: docker
 
       - uses: docker/login-action@v3
         with:
